@@ -15,8 +15,9 @@ db = firestore.client()
 app = FastAPI()
 
 # Load model + encoder
-rf = joblib.load("model.pkl")
-le = joblib.load("label.pkl")
+rf = joblib.load("cloud-api/model.pkl")
+le = joblib.load("cloud-api/label.pkl")
+
 
 # Persistence & accumulation state
 window = deque(maxlen=10)   # 10 readings = 10 minutes if 1 reading/min
@@ -75,3 +76,4 @@ def predict(data: SensorData):
 
     # Return final response
     return data_to_store
+
