@@ -1,8 +1,7 @@
 fastapi
 uvicorn
-scikit-learn
+firebase-admin
 joblib
 numpy
+scikit-learn
 pydantic
-firebase-admin
-
