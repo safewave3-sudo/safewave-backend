@@ -89,12 +89,17 @@ def predict(data: SensorData):
         high_count = 0  # reset on safe conditions
 
     # ----- Escalation Logic -----
-    if 10 <= high_count < 20:
-        status = "WARNING"
-    elif high_count >= 20:
+    if high_count < 10:
+    status = "SAFE"
+elif 10 <= high_count < 20:
+    status = "WARNING"
+else:
+    # high_count >= 20
+    if (instant == "HIGH_RISK") and sensor_trigger:
         status = "HIGH_RISK"
     else:
-        status = "SAFE"
+        status = "WARNING"
+
 
     # Save back to Firebase
     save_state(high_count, status)
@@ -116,3 +121,4 @@ def predict(data: SensorData):
     db.collection("safewave_readings").add(data_to_store)
 
     return data_to_store
+
