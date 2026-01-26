@@ -6,6 +6,7 @@ import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 from collections import deque
+from datetime import datetime
 
 # Firebase setup
 cred = credentials.Certificate("firebase_key.json")
@@ -18,10 +19,13 @@ app = FastAPI()
 rf = joblib.load("cloud-api/model.pkl")
 le = joblib.load("cloud-api/label.pkl")
 
-
 # Persistence & accumulation state
-window = deque(maxlen=10)   # 10 readings = 10 minutes if 1 reading/min
-score = 0                   # long-term accumulation score
+window = deque(maxlen=10)   # short-term instant persistence window
+
+# Firestore persistence document
+STATE_DOC = "risk_state"
+STATE_COLLECTION = "system"
+
 
 class SensorData(BaseModel):
     ph: float
@@ -30,34 +34,60 @@ class SensorData(BaseModel):
     turb: float
     flow: int
 
+
+def get_state():
+    doc = db.collection(STATE_COLLECTION).document(STATE_DOC).get()
+    if doc.exists:
+        return doc.to_dict()
+    return {"high_count": 0, "status": "SAFE", "timestamp": None}
+
+
+def save_state(high_count, status):
+    db.collection(STATE_COLLECTION).document(STATE_DOC).set({
+        "high_count": high_count,
+        "status": status,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+
 @app.post("/predict")
 def predict(data: SensorData):
-    global score
-
-    # Instant ML prediction
+    # ML instant prediction
     X = np.array([[data.ph, data.temp, data.tds, data.turb, data.flow]])
     pred = rf.predict(X)[0]
     instant = le.inverse_transform([pred])[0]  # "SAFE" or "HIGH_RISK"
 
-    # Persistence Layer (short-term)
-    window.append(1 if instant == "HIGH_RISK" else 0)
+    # ----- Sensor Threshold Logic -----
+    sensor_trigger = False
+    if data.temp > 30: sensor_trigger = True
+    if data.turb > 10: sensor_trigger = True
+    if data.flow < 3: sensor_trigger = True
 
-    if len(window) == window.maxlen and sum(window) >= 0.7 * window.maxlen:
-        persistent = True
-        score += 1
+    # Combined Trigger
+    combined_trigger = (instant == "HIGH_RISK") or sensor_trigger
+
+    # ===== Load persistence state from Firestore =====
+    state = get_state()
+    high_count = state.get("high_count", 0)
+
+    # ===== Persistence accumulation =====
+    if combined_trigger:
+        high_count += 1
     else:
-        persistent = False
-        score = max(0, score - 1)
+        high_count = 0  # reset on safe readings
 
-    # Accumulation Layer (long-term)
-    if score > 40:
-        final_risk = "HIGH_RISK"
-    elif score > 10:
-        final_risk = "WARNING"
+    # ===== Escalation =====
+    if 10 <= high_count < 20:
+        status = "WARNING"
+    elif high_count >= 20:
+        status = "HIGH_RISK"
     else:
-        final_risk = "SAFE"
+        status = "SAFE"
 
-    # Prepare record
+    # Save state back to Firestore
+    save_state(high_count, status)
+
+    # Store raw reading data into Firestore
     data_to_store = {
         "ph": data.ph,
         "temp": data.temp,
@@ -65,15 +95,12 @@ def predict(data: SensorData):
         "turb": data.turb,
         "flow": data.flow,
         "instant": instant,
-        "persistent": persistent,
-        "score": score,
-        "final_risk": final_risk,
-        "timestamp": datetime.datetime.utcnow().isoformat()
+        "sensor_trigger": sensor_trigger,
+        "high_count": high_count,
+        "status": status,
+        "timestamp": datetime.utcnow().isoformat()
     }
 
-    # Store in Firestore
     db.collection("safewave_readings").add(data_to_store)
 
-    # Return final response
     return data_to_store
-
