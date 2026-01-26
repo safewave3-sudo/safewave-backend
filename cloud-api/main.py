@@ -37,7 +37,6 @@ class SensorData(BaseModel):
     turb: float
     flow: int
 
-
 # -------------------------------
 # Firestore helpers
 # -------------------------------
@@ -47,14 +46,12 @@ def get_state():
         return doc.to_dict()
     return {"high_count": 0, "status": "SAFE", "timestamp": None}
 
-
 def save_state(high_count, status):
     db.collection(STATE_COLLECTION).document(STATE_DOC).set({
         "high_count": high_count,
         "status": status,
         "timestamp": datetime.utcnow().isoformat()
     })
-
 
 # -------------------------------
 # Prediction endpoint
@@ -68,14 +65,14 @@ def predict(data: SensorData):
     instant = le.inverse_transform([pred])[0]  # "SAFE" or "HIGH_RISK"
 
     # ----- Sensor Biological Threshold Logic -----
-    warm = data.temp > 28         # warm water condition
-    turbid = data.turb > 10       # turbidity (organic matter)
-    stagnant = data.flow < 3      # stagnant water
+    warm = data.temp > 28        # warm water
+    turbid = data.turb > 10      # high organic load
+    stagnant = data.flow < 3     # low/zero flow
 
     # 3-factor biological trigger
     sensor_trigger = warm and turbid and stagnant
 
-    # Combined trigger (ML OR biology)
+    # ML OR biology triggers escalation
     combined_trigger = (instant == "HIGH_RISK") or sensor_trigger
 
     # ----- Persistence Loading -----
@@ -86,20 +83,19 @@ def predict(data: SensorData):
     if combined_trigger:
         high_count += 1
     else:
-        high_count = 0  # reset on safe conditions
+        high_count = 0  # reset only if safe conditions
 
     # ----- Escalation Logic -----
     if high_count < 10:
-    status = "SAFE"
-elif 10 <= high_count < 20:
-    status = "WARNING"
-else:
-    # high_count >= 20
-    if (instant == "HIGH_RISK") and sensor_trigger:
-        status = "HIGH_RISK"
-    else:
+        status = "SAFE"
+    elif 10 <= high_count < 20:
         status = "WARNING"
-
+    else:
+        # high_count >= 20 (long-term confirming period)
+        if (instant == "HIGH_RISK") and sensor_trigger:
+            status = "HIGH_RISK"
+        else:
+            status = "WARNING"
 
     # Save back to Firebase
     save_state(high_count, status)
@@ -119,6 +115,4 @@ else:
     }
 
     db.collection("safewave_readings").add(data_to_store)
-
     return data_to_store
-
