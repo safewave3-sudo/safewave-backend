@@ -10,36 +10,29 @@ from datetime import datetime
 # Firebase initialization
 # -------------------------------
 cred = credentials.Certificate("firebase_key.json")
-firebase_admin.initialize_app(cred)
+
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred)
+
 db = firestore.client()
 
 # -------------------------------
 # FastAPI setup
 # -------------------------------
-app = FastAPI()
+app = FastAPI(title="SAFEWAVE ML API")
 
 # -------------------------------
-# Load ML models
+# Load ML models (ADVISORY ONLY)
 # -------------------------------
 rf = joblib.load("cloud-api/model.pkl")
 le = joblib.load("cloud-api/label.pkl")
 
 # -------------------------------
-# Persistence state document
+# Persistence state (Firestore)
 # -------------------------------
-STATE_DOC = "risk_state"
 STATE_COLLECTION = "system"
+STATE_DOC = "risk_state"
 
-class SensorData(BaseModel):
-    ph: float
-    temp: float
-    tds: float
-    turb: float
-    flow: int
-
-# -------------------------------
-# Firestore helpers
-# -------------------------------
 def get_state():
     doc = db.collection(STATE_COLLECTION).document(STATE_DOC).get()
     if doc.exists:
@@ -54,65 +47,116 @@ def save_state(high_count, status):
     })
 
 # -------------------------------
+# Input schema
+# -------------------------------
+class SensorData(BaseModel):
+    ph: float
+    temp: float
+    tds: float
+    turb: float
+    flow: int   # 0 = stagnant, 1 = flowing
+
+# -------------------------------
 # Prediction endpoint
 # -------------------------------
 @app.post("/predict")
 def predict(data: SensorData):
 
-    # ----- ML Instant Prediction -----
+    # =====================================================
+    # 1️⃣ BIOLOGICAL RISK FLAGS (AUTHORITATIVE)
+    # =====================================================
+    temp_risk = data.temp >= 30        # PRIMARY
+    turb_risk = data.turb >= 10        # PRIMARY
+    tds_risk  = data.tds >= 400        # SECONDARY
+    flow_risk = data.flow == 0         # SECONDARY
+    ph_risk   = data.ph >= 8.5         # SUPPORTING ONLY
+
+    # =====================================================
+    # 2️⃣ ML PREDICTION (LOGGING ONLY — NOT DECISION)
+    # =====================================================
     X = np.array([[data.ph, data.temp, data.tds, data.turb, data.flow]])
     pred = rf.predict(X)[0]
-    instant = le.inverse_transform([pred])[0]  # "SAFE" or "HIGH_RISK"
+    instant_ml = le.inverse_transform([pred])[0]  # SAFE / HIGH_RISK
 
-    # ----- Sensor Biological Threshold Logic -----
-    warm = data.temp > 28        # warm water
-    turbid = data.turb > 10      # high organic load
-    stagnant = data.flow < 3     # low/zero flow
+    # =====================================================
+    # 3️⃣ HARD BIOLOGICAL SAFE OVERRIDE (CRITICAL)
+    # If temperature AND turbidity are SAFE → ALWAYS SAFE
+    # =====================================================
+    if not temp_risk and not turb_risk:
+        save_state(0, "SAFE")
 
-    # 3-factor biological trigger
-    sensor_trigger = warm and turbid and stagnant
+        result = {
+            "ph": data.ph,
+            "temp": data.temp,
+            "tds": data.tds,
+            "turb": data.turb,
+            "flow": data.flow,
+            "instant": instant_ml,     # ML logged only
+            "sensor_trigger": False,
+            "high_count": 0,
+            "status": "SAFE",
+            "timestamp": datetime.utcnow().isoformat()
+        }
 
-    # ML OR biology triggers escalation
-    combined_trigger = (instant == "HIGH_RISK") or sensor_trigger
+        db.collection("safewave_readings").add(result)
+        return result
 
-    # ----- Persistence Loading -----
+    # =====================================================
+    # 4️⃣ BIOLOGICAL RISK SCORE
+    # =====================================================
+    bio_score = 0
+    if temp_risk: bio_score += 2
+    if turb_risk: bio_score += 2
+    if tds_risk:  bio_score += 1
+    if flow_risk: bio_score += 1
+    if ph_risk:   bio_score += 0.5
+
+    # =====================================================
+    # 5️⃣ PERSISTENCE (FIRESTORE‑BASED)
+    # =====================================================
     state = get_state()
     high_count = state.get("high_count", 0)
 
-    # ----- Persistence Accumulation -----
-    if combined_trigger:
+    if bio_score >= 3:
         high_count += 1
     else:
-        high_count = 0  # reset only if safe conditions
+        # fast recovery when biology improves
+        high_count = max(0, high_count - 2)
 
-    # ----- Escalation Logic -----
-    if high_count < 10:
-        status = "SAFE"
-    elif 10 <= high_count < 20:
+    # =====================================================
+    # 6️⃣ FINAL BIOLOGICAL DECISION
+    # =====================================================
+    if bio_score >= 5 and high_count >= 10:
+        status = "HIGH_RISK"
+    elif bio_score >= 3:
         status = "WARNING"
     else:
-        # high_count >= 20 (long-term confirming period)
-        if (instant == "HIGH_RISK") and sensor_trigger:
-            status = "HIGH_RISK"
-        else:
-            status = "WARNING"
+        status = "SAFE"
 
-    # Save back to Firebase
     save_state(high_count, status)
 
-    # ----- Store reading into Firebase -----
-    data_to_store = {
+    # =====================================================
+    # 7️⃣ STORE + RETURN
+    # =====================================================
+    result = {
         "ph": data.ph,
         "temp": data.temp,
         "tds": data.tds,
         "turb": data.turb,
         "flow": data.flow,
-        "instant": instant,
-        "sensor_trigger": sensor_trigger,
+        "instant": instant_ml,
+        "sensor_trigger": bio_score >= 3,
         "high_count": high_count,
         "status": status,
         "timestamp": datetime.utcnow().isoformat()
     }
 
-    db.collection("safewave_readings").add(data_to_store)
-    return data_to_store
+    db.collection("safewave_readings").add(result)
+    return result
+
+# -------------------------------
+# Health endpoint
+# -------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
