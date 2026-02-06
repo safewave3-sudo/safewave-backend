@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 import numpy as np
@@ -19,6 +20,17 @@ db = firestore.client()
 # FastAPI setup
 # -------------------------------
 app = FastAPI(title="SAFEWAVE ML API")
+
+# -------------------------------
+# CORS (Allow Mobile App Access)
+# -------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # allow all (safe for your project)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------------
 # Load ML models (ADVISORY ONLY)
