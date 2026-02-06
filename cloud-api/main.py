@@ -10,7 +10,6 @@ from datetime import datetime
 # Firebase initialization
 # -------------------------------
 cred = credentials.Certificate("firebase_key.json")
-
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
@@ -62,26 +61,19 @@ class SensorData(BaseModel):
 @app.post("/predict")
 def predict(data: SensorData):
 
-    # =====================================================
-    # 1️⃣ BIOLOGICAL RISK FLAGS (AUTHORITATIVE)
-    # =====================================================
-    temp_risk = data.temp >= 30        # PRIMARY
-    turb_risk = data.turb >= 10        # PRIMARY
-    tds_risk  = data.tds >= 400        # SECONDARY
-    flow_risk = data.flow == 0         # SECONDARY
-    ph_risk   = data.ph >= 8.5         # SUPPORTING ONLY
+    # 1️⃣ BIOLOGICAL RISK FLAGS
+    temp_risk = data.temp >= 30
+    turb_risk = data.turb >= 10
+    tds_risk  = data.tds >= 400
+    flow_risk = data.flow == 0
+    ph_risk   = data.ph >= 8.5
 
-    # =====================================================
-    # 2️⃣ ML PREDICTION (LOGGING ONLY — NOT DECISION)
-    # =====================================================
+    # 2️⃣ ML PREDICTION (LOGGING ONLY)
     X = np.array([[data.ph, data.temp, data.tds, data.turb, data.flow]])
     pred = rf.predict(X)[0]
-    instant_ml = le.inverse_transform([pred])[0]  # SAFE / HIGH_RISK
+    instant_ml = le.inverse_transform([pred])[0]
 
-    # =====================================================
-    # 3️⃣ HARD BIOLOGICAL SAFE OVERRIDE (CRITICAL)
-    # If temperature AND turbidity are SAFE → ALWAYS SAFE
-    # =====================================================
+    # 3️⃣ HARD SAFE OVERRIDE
     if not temp_risk and not turb_risk:
         save_state(0, "SAFE")
 
@@ -91,7 +83,7 @@ def predict(data: SensorData):
             "tds": data.tds,
             "turb": data.turb,
             "flow": data.flow,
-            "instant": instant_ml,     # ML logged only
+            "instant": instant_ml,
             "sensor_trigger": False,
             "high_count": 0,
             "status": "SAFE",
@@ -101,9 +93,7 @@ def predict(data: SensorData):
         db.collection("safewave_readings").add(result)
         return result
 
-    # =====================================================
     # 4️⃣ BIOLOGICAL RISK SCORE
-    # =====================================================
     bio_score = 0
     if temp_risk: bio_score += 2
     if turb_risk: bio_score += 2
@@ -111,21 +101,16 @@ def predict(data: SensorData):
     if flow_risk: bio_score += 1
     if ph_risk:   bio_score += 0.5
 
-    # =====================================================
-    # 5️⃣ PERSISTENCE (FIRESTORE‑BASED)
-    # =====================================================
+    # 5️⃣ PERSISTENCE
     state = get_state()
     high_count = state.get("high_count", 0)
 
     if bio_score >= 3:
         high_count += 1
     else:
-        # fast recovery when biology improves
         high_count = max(0, high_count - 2)
 
-    # =====================================================
-    # 6️⃣ FINAL BIOLOGICAL DECISION
-    # =====================================================
+    # 6️⃣ FINAL DECISION
     if bio_score >= 5 and high_count >= 10:
         status = "HIGH_RISK"
     elif bio_score >= 3:
@@ -135,9 +120,7 @@ def predict(data: SensorData):
 
     save_state(high_count, status)
 
-    # =====================================================
     # 7️⃣ STORE + RETURN
-    # =====================================================
     result = {
         "ph": data.ph,
         "temp": data.temp,
@@ -153,6 +136,27 @@ def predict(data: SensorData):
 
     db.collection("safewave_readings").add(result)
     return result
+
+# -------------------------------
+# Latest reading for Mobile App
+# -------------------------------
+@app.get("/latest")
+def latest():
+    try:
+        docs = (
+            db.collection("safewave_readings")
+            .order_by("timestamp", direction=firestore.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+
+        for doc in docs:
+            return doc.to_dict()
+
+        return {"error": "No data available"}
+
+    except Exception as e:
+        return {"error": str(e)}
 
 # -------------------------------
 # Health endpoint
