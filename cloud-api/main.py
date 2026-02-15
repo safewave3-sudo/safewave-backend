@@ -159,7 +159,7 @@ def predict(data: SensorData):
     }
     db.collection(RAW_COLLECTION).add(raw_entry)
 
-    # Fetch last 6 hours history
+    # Fetch last 6 hours
     now_time = datetime.now(ist)
     six_hours_ago = now_time - timedelta(hours=6)
 
@@ -184,40 +184,40 @@ def predict(data: SensorData):
         row_df = pd.DataFrame([{col: feature_dict[col] for col in FEATURE_COLS}])
         prob_high = rf.predict_proba(row_df)[0][1]
 
-    # Biological Model
-    if data.temp < 30:
-        bio_score = 0
-        high_count = 0
-        status = "SAFE"
+    # =====================================
+    # HYBRID EARLY WARNING LOGIC
+    # =====================================
+
+    strong_temp = data.temp >= 34
+    turb_risk = data.turb >= 60
+    flow_risk = data.flow == 0
+    tds_risk = data.tds >= 250
+    ph_risk = data.ph >= 7.5
+
+    bio_score = (
+        (3 if strong_temp else 1) +
+        (1.5 if turb_risk else 0) +
+        (1 if tds_risk else 0) +
+        (1 if flow_risk else 0) +
+        (0.5 if ph_risk else 0)
+    )
+
+    state = get_state(data.device_id)
+    high_count = state.get("high_count", 0)
+
+    # Strong biological growth trigger
+    strong_growth = strong_temp and turb_risk and flow_risk
+
+    if strong_growth:
+        # ML accelerates escalation
+        high_count += 1 + int(prob_high * 2)
     else:
-        strong_temp = data.temp >= 34
-        turb_risk = data.turb >= 60
-        tds_risk = data.tds >= 250
-        flow_risk = data.flow == 0
-        ph_risk = data.ph >= 7.5
+        high_count = max(0, high_count - 1)
 
-        bio_score = (
-            (3 if strong_temp else 1) +
-            (1.5 if turb_risk else 0) +
-            (1 if tds_risk else 0) +
-            (1 if flow_risk else 0) +
-            (0.5 if ph_risk else 0)
-        )
+    # Threshold reduced for early warning
+    status = "HIGH_RISK" if high_count >= 8 else "SAFE"
 
-        ml_score = prob_high * 10
-        final_score = 0.75 * bio_score + 0.25 * ml_score
-
-        state = get_state(data.device_id)
-        high_count = state.get("high_count", 0)
-
-        if final_score > 6:
-            high_count += 1
-        else:
-            high_count = max(0, high_count - 1)
-
-        status = "HIGH_RISK" if high_count >= 10 else "SAFE"
-
-    risk_percent = min(100, high_count * 10)
+    risk_percent = min(100, high_count * 12.5)
 
     save_state(data.device_id, high_count, status)
 
@@ -232,7 +232,7 @@ def predict(data: SensorData):
         "flow": data.flow,
         "ml_probability": round(prob_high, 4),
         "bio_score": round(bio_score, 2),
-        "risk_percent": risk_percent,
+        "risk_percent": round(risk_percent, 2),
         "high_count": high_count,
         "status": status,
         "timestamp": now_ist()
