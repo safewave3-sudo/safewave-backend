@@ -6,7 +6,7 @@ import numpy as np
 import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
-import pytz   # ✅ for IST timezone
+import pytz
 
 # -------------------------------
 # Firebase initialization
@@ -30,13 +30,13 @@ app.add_middleware(
 )
 
 # -------------------------------
-# Load ML models (Advisory only)
+# Load ML models
 # -------------------------------
 rf = joblib.load("cloud-api/model.pkl")
 le = joblib.load("cloud-api/label.pkl")
 
 # -------------------------------
-# IST Time Helper
+# Time helper (IST)
 # -------------------------------
 ist = pytz.timezone("Asia/Kolkata")
 
@@ -44,11 +44,17 @@ def now_ist():
     return datetime.now(ist).isoformat()
 
 # -------------------------------
-# Persistence state
+# Collections
 # -------------------------------
 STATE_COLLECTION = "system"
 STATE_DOC = "risk_state"
 
+DEVICE_COLLECTION = "devices"
+OFFLINE_TIMEOUT = 60   # seconds
+
+# -------------------------------
+# Persistence state
+# -------------------------------
 def get_state():
     doc = db.collection(STATE_COLLECTION).document(STATE_DOC).get()
     if doc.exists:
@@ -59,18 +65,42 @@ def save_state(high_count, status):
     db.collection(STATE_COLLECTION).document(STATE_DOC).set({
         "high_count": high_count,
         "status": status,
-        "timestamp": now_ist()   # ✅ IST time
+        "timestamp": now_ist()
     })
+
+# -------------------------------
+# Device auto-register + heartbeat
+# -------------------------------
+def update_device_status(device_id, device_name, location_name):
+    doc_ref = db.collection(DEVICE_COLLECTION).document(device_id)
+    doc = doc_ref.get()
+
+    data = {
+        "device_id": device_id,
+        "device_name": device_name,
+        "location_name": location_name,
+        "last_seen": now_ist(),
+        "status": "ONLINE"
+    }
+
+    if not doc.exists:
+        doc_ref.set(data)
+    else:
+        doc_ref.update(data)
 
 # -------------------------------
 # Input schema
 # -------------------------------
 class SensorData(BaseModel):
+    device_id: str
+    device_name: str
+    location_name: str
+
     ph: float
     temp: float
     tds: float
     turb: float
-    flow: int   # 0 = stagnant, 1 = flowing
+    flow: int   # 0 stagnant, 1 flowing
 
 # -------------------------------
 # Prediction endpoint
@@ -78,10 +108,14 @@ class SensorData(BaseModel):
 @app.post("/predict")
 def predict(data: SensorData):
 
-    # =====================================================
-    # 1️⃣ BIOLOGICAL CONDITIONS — Naegleria fowleri science
-    # =====================================================
+    # Update device heartbeat
+    update_device_status(
+        data.device_id,
+        data.device_name,
+        data.location_name
+    )
 
+    # ---------------- Biological Conditions ----------------
     cool_temp = data.temp < 25
     moderate_temp = 25 <= data.temp < 34
     high_temp = data.temp >= 34
@@ -91,18 +125,13 @@ def predict(data: SensorData):
     flow_risk = data.flow == 0
     ph_risk   = data.ph >= 7.5
 
-    # =====================================================
-    # 2️⃣ ML Prediction (Advisory only)
-    # =====================================================
+    # ---------------- ML Prediction ----------------
     X = np.array([[data.ph, data.temp, data.tds, data.turb, data.flow]])
     pred = rf.predict(X)[0]
     instant_ml = le.inverse_transform([pred])[0]
 
-    # =====================================================
-    # 3️⃣ BIOLOGICAL SCORE
-    # =====================================================
+    # ---------------- Biological Score ----------------
     bio_score = 0
-
     if high_temp:
         bio_score += 3
     elif moderate_temp:
@@ -124,9 +153,7 @@ def predict(data: SensorData):
 
     risk_percent = min(100, int((bio_score / 7) * 100))
 
-    # =====================================================
-    # 4️⃣ PERSISTENCE
-    # =====================================================
+    # ---------------- Persistence ----------------
     state = get_state()
     high_count = state.get("high_count", 0)
 
@@ -135,9 +162,7 @@ def predict(data: SensorData):
     else:
         high_count = max(0, high_count - 2)
 
-    # =====================================================
-    # 5️⃣ FINAL DECISION
-    # =====================================================
+    # ---------------- Final Decision ----------------
     other_score = 0
     if turb_risk: other_score += 1
     if tds_risk:  other_score += 1
@@ -147,55 +172,73 @@ def predict(data: SensorData):
     if cool_temp:
         status = "SAFE"
     elif moderate_temp:
-        if other_score < 1.5:
-            status = "SAFE"
-        else:
-            status = "WARNING"
+        status = "SAFE" if other_score < 1.5 else "WARNING"
     else:
         if other_score < 1.5:
             status = "WARNING"
         else:
-            if high_count >= 6:
-                status = "HIGH_RISK"
-            else:
-                status = "WARNING"
+            status = "HIGH_RISK" if high_count >= 6 else "WARNING"
 
     save_state(high_count, status)
 
-    # =====================================================
-    # 6️⃣ STORE RESULT
-    # =====================================================
+    # ---------------- Store result ----------------
     result = {
+        "device_id": data.device_id,
+        "device_name": data.device_name,
+        "location_name": data.location_name,
+
         "ph": data.ph,
         "temp": data.temp,
         "tds": data.tds,
         "turb": data.turb,
         "flow": data.flow,
+
         "instant": instant_ml,
         "bio_score": round(bio_score, 2),
         "risk_percent": risk_percent,
         "high_count": high_count,
         "status": status,
-        "timestamp": now_ist()   # ✅ IST time fixed
+        "timestamp": now_ist()
     }
 
     db.collection("safewave_readings").add(result)
     return result
 
 # -------------------------------
-# Latest reading
+# Device list with ONLINE/OFFLINE
 # -------------------------------
-@app.get("/latest")
-def latest():
+@app.get("/devices")
+def get_devices():
+    devices = []
+    now = datetime.now(ist)
+
+    docs = db.collection(DEVICE_COLLECTION).stream()
+    for doc in docs:
+        d = doc.to_dict()
+
+        last_seen = datetime.fromisoformat(d["last_seen"])
+        diff = (now - last_seen).total_seconds()
+
+        d["live_status"] = "OFFLINE" if diff > OFFLINE_TIMEOUT else "ONLINE"
+        devices.append(d)
+
+    return devices
+
+# -------------------------------
+# Latest reading per device
+# -------------------------------
+@app.get("/latest/{device_id}")
+def latest_device(device_id: str):
     docs = (
         db.collection("safewave_readings")
+        .where("device_id", "==", device_id)
         .order_by("timestamp", direction=firestore.Query.DESCENDING)
         .limit(1)
         .stream()
     )
     for doc in docs:
         return doc.to_dict()
-    return {"error": "No data available"}
+    return {"error": "No data"}
 
 # -------------------------------
 # Health check
