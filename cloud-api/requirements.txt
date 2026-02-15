@@ -3,7 +3,8 @@ uvicorn
 firebase-admin
 joblib
 numpy
-scikit-learn
+pandas
 pydantic
+scikit-learn
+python-dotenv
 pytz
-
