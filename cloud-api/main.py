@@ -10,18 +10,18 @@ from datetime import datetime, timedelta
 import pytz
 from pathlib import Path
 
-# ================================
-# Firebase initialization
-# ================================
+# =====================================
+# Firebase Initialization
+# =====================================
 cred = credentials.Certificate("firebase_key.json")
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
 
-# ================================
-# FastAPI setup
-# ================================
+# =====================================
+# FastAPI Setup
+# =====================================
 app = FastAPI(title="SAFEWAVE ML API")
 
 app.add_middleware(
@@ -32,35 +32,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================================
-# Load trained ML model
-# ================================
+# =====================================
+# Load Trained ML Model
+# =====================================
 BASE_DIR = Path(__file__).resolve().parent
 saved = joblib.load(BASE_DIR / "rf_model.joblib")
 
 rf = saved["model"]
 FEATURE_COLS = saved["features"]
 
-# ================================
-# Time helper
-# ================================
+# =====================================
+# Time Helper
+# =====================================
 ist = pytz.timezone("Asia/Kolkata")
 
 def now_ist():
     return datetime.now(ist).isoformat()
 
-# ================================
-# Collections
-# ================================
+# =====================================
+# Firestore Collections
+# =====================================
 DEVICE_COLLECTION = "devices"
 STATE_COLLECTION = "device_state"
 RAW_COLLECTION = "sensor_raw"
 READINGS_COLLECTION = "safewave_readings"
+
 OFFLINE_TIMEOUT = 60
 
-# ================================
-# Device state per device
-# ================================
+# =====================================
+# Device State Management
+# =====================================
 def get_state(device_id):
     doc = db.collection(STATE_COLLECTION).document(device_id).get()
     if doc.exists:
@@ -74,23 +75,21 @@ def save_state(device_id, high_count, status):
         "timestamp": now_ist()
     })
 
-# ================================
-# Device heartbeat
-# ================================
+# =====================================
+# Device Heartbeat
+# =====================================
 def update_device_status(device_id, device_name, location_name):
-    doc_ref = db.collection(DEVICE_COLLECTION).document(device_id)
-    data = {
+    db.collection(DEVICE_COLLECTION).document(device_id).set({
         "device_id": device_id,
         "device_name": device_name,
         "location_name": location_name,
         "last_seen": now_ist(),
         "status": "ONLINE"
-    }
-    doc_ref.set(data, merge=True)
+    }, merge=True)
 
-# ================================
-# Input schema
-# ================================
+# =====================================
+# Input Schema
+# =====================================
 class SensorData(BaseModel):
     device_id: str
     device_name: str
@@ -101,9 +100,9 @@ class SensorData(BaseModel):
     turb: float
     flow: int  # 0 stagnant, 1 flowing
 
-# ================================
-# Feature builder
-# ================================
+# =====================================
+# Rolling Feature Builder
+# =====================================
 def build_features(df_hist, latest_data):
     now_time = datetime.now(ist)
 
@@ -129,16 +128,16 @@ def build_features(df_hist, latest_data):
         "flow_last": latest_data.flow,
 
         "hour": now_time.hour,
-        "hour_sin": np.sin(2*np.pi*now_time.hour/24),
-        "hour_cos": np.cos(2*np.pi*now_time.hour/24),
+        "hour_sin": np.sin(2 * np.pi * now_time.hour / 24),
+        "hour_cos": np.cos(2 * np.pi * now_time.hour / 24),
         "dayofweek": now_time.weekday()
     }
 
     return feature_dict
 
-# ================================
-# Prediction endpoint
-# ================================
+# =====================================
+# Prediction Endpoint
+# =====================================
 @app.post("/predict")
 def predict(data: SensorData):
 
@@ -148,7 +147,7 @@ def predict(data: SensorData):
         data.location_name
     )
 
-    # ================= RAW STORAGE =================
+    # Store raw reading
     raw_entry = {
         "device_id": data.device_id,
         "timestamp": now_ist(),
@@ -158,15 +157,14 @@ def predict(data: SensorData):
         "turb": data.turb,
         "flow": data.flow
     }
-
     db.collection(RAW_COLLECTION).add(raw_entry)
 
-    # ================= FETCH LAST 6 HOURS =================
+    # Fetch last 6 hours history
     now_time = datetime.now(ist)
     six_hours_ago = now_time - timedelta(hours=6)
 
-    docs = db.collection(RAW_COLLECTION)\
-        .where("device_id", "==", data.device_id)\
+    docs = db.collection(RAW_COLLECTION) \
+        .where("device_id", "==", data.device_id) \
         .stream()
 
     records = []
@@ -177,7 +175,7 @@ def predict(data: SensorData):
         if ts >= six_hours_ago:
             records.append(d)
 
-    # ================= ML PROBABILITY =================
+    # ML Probability
     if len(records) < 3:
         prob_high = 0.0
     else:
@@ -186,7 +184,7 @@ def predict(data: SensorData):
         row_df = pd.DataFrame([{col: feature_dict[col] for col in FEATURE_COLS}])
         prob_high = rf.predict_proba(row_df)[0][1]
 
-    # ================= BIOLOGICAL LOGIC =================
+    # Biological Model
     if data.temp < 30:
         bio_score = 0
         high_count = 0
@@ -223,7 +221,6 @@ def predict(data: SensorData):
 
     save_state(data.device_id, high_count, status)
 
-    # ================= STORE FINAL RESULT =================
     result = {
         "device_id": data.device_id,
         "device_name": data.device_name,
@@ -245,9 +242,52 @@ def predict(data: SensorData):
 
     return result
 
-# ================================
-# Health check
-# ================================
+# =====================================
+# Devices Endpoint
+# =====================================
+@app.get("/devices")
+def get_devices():
+    devices = []
+    now = datetime.now(ist)
+
+    docs = db.collection(DEVICE_COLLECTION).stream()
+
+    for doc in docs:
+        d = doc.to_dict()
+
+        if "last_seen" in d:
+            last_seen = datetime.fromisoformat(d["last_seen"])
+            diff = (now - last_seen).total_seconds()
+            d["live_status"] = "OFFLINE" if diff > OFFLINE_TIMEOUT else "ONLINE"
+        else:
+            d["live_status"] = "UNKNOWN"
+
+        devices.append(d)
+
+    return devices
+
+# =====================================
+# Latest Reading Endpoint
+# =====================================
+@app.get("/latest/{device_id}")
+def latest_device(device_id: str):
+
+    docs = (
+        db.collection(READINGS_COLLECTION)
+        .where("device_id", "==", device_id)
+        .order_by("timestamp", direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+
+    for doc in docs:
+        return doc.to_dict()
+
+    return {"error": "No data"}
+
+# =====================================
+# Health Endpoint
+# =====================================
 @app.get("/health")
 def health():
     return {"status": "ok"}
