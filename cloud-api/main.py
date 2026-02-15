@@ -22,7 +22,7 @@ db = firestore.client()
 # =====================================
 # FastAPI Setup
 # =====================================
-app = FastAPI(title="Naegleria fowleri Environmental Suitability API")
+app = FastAPI(title="SAFEWAVE ML API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,23 +110,18 @@ def build_features(df_hist, latest_data):
         "temp_mean": df_hist["temp"].mean(),
         "temp_std": df_hist["temp"].std(),
         "temp_last": latest_data.temp,
-
         "turb_mean": df_hist["turb"].mean(),
         "turb_std": df_hist["turb"].std(),
         "turb_last": latest_data.turb,
-
         "ph_mean": df_hist["ph"].mean(),
         "ph_std": df_hist["ph"].std(),
         "ph_last": latest_data.ph,
-
         "tds_mean": df_hist["tds"].mean(),
         "tds_std": df_hist["tds"].std(),
         "tds_last": latest_data.tds,
-
         "flow_mean": df_hist["flow"].mean(),
         "flow_std": df_hist["flow"].std(),
         "flow_last": latest_data.flow,
-
         "hour": now_time.hour,
         "hour_sin": np.sin(2 * np.pi * now_time.hour / 24),
         "hour_cos": np.cos(2 * np.pi * now_time.hour / 24),
@@ -139,11 +134,7 @@ def build_features(df_hist, latest_data):
 @app.post("/predict")
 def predict(data: SensorData):
 
-    update_device_status(
-        data.device_id,
-        data.device_name,
-        data.location_name
-    )
+    update_device_status(data.device_id, data.device_name, data.location_name)
 
     # Store raw reading
     raw_entry = {
@@ -161,8 +152,8 @@ def predict(data: SensorData):
     now_time = datetime.now(ist)
     six_hours_ago = now_time - timedelta(hours=6)
 
-    docs = db.collection(RAW_COLLECTION) \
-        .where("device_id", "==", data.device_id) \
+    docs = db.collection(RAW_COLLECTION)\
+        .where("device_id", "==", data.device_id)\
         .stream()
 
     records = []
@@ -172,7 +163,7 @@ def predict(data: SensorData):
         if ts >= six_hours_ago:
             records.append(d)
 
-    # ML probability
+    # ML Probability
     if len(records) < 3:
         prob_high = 0.0
     else:
@@ -184,66 +175,70 @@ def predict(data: SensorData):
     # =====================================
     # ECOLOGICAL SUITABILITY MODEL
     # =====================================
-
     state = get_state(data.device_id)
     high_count = state.get("high_count", 0)
 
     risk_factors = []
 
-    # Temperature zoning
+    # Hard biological brake
     if data.temp < 30:
-        temp_score = 0
-    elif 30 <= data.temp < 34:
-        temp_score = 2
-        risk_factors.append("Warm water zone")
-    elif 34 <= data.temp <= 38:
-        temp_score = 4
-        risk_factors.append("Optimal growth temperature")
-    else:
-        temp_score = 5
-        risk_factors.append("High metabolic temperature zone")
-
-    turb_score = 2 if data.turb >= 60 else 0
-    flow_score = 3 if data.flow == 0 else 0
-    tds_score = 1 if data.tds >= 250 else 0
-    ph_score = 1 if data.ph >= 7.5 else 0
-
-    if turb_score:
-        risk_factors.append("Elevated turbidity")
-    if flow_score:
-        risk_factors.append("Stagnant water")
-    if tds_score:
-        risk_factors.append("High dissolved solids")
-    if ph_score:
-        risk_factors.append("Alkaline pH")
-
-    bio_score = temp_score + turb_score + flow_score + tds_score + ph_score
-
-    ml_influence = prob_high * 3
-    final_score = bio_score + ml_influence
-
-    if prob_high > 0.6:
-        risk_factors.append("ML anomaly pattern detected")
-
-    # =====================================
-    # Multi-Level Risk Classification
-    # =====================================
-
-    if final_score < 4:
-        high_count = max(0, high_count - 1)
-    elif 4 <= final_score < 8:
-        high_count += 1
-    else:
-        high_count += 2
-
-    if high_count >= 12:
-        status = "HIGH_GROWTH_POTENTIAL"
-    elif high_count >= 6:
-        status = "SUITABLE_CONDITIONS"
-    else:
+        high_count = max(0, high_count - 3)
         status = "SAFE"
+        bio_score = 0
+        final_score = 0
+        risk_factors.append("Temperature below growth threshold")
 
-    risk_percent = min(100, round(high_count * 8, 1))
+    else:
+
+        # Temperature zoning
+        if 30 <= data.temp < 34:
+            temp_score = 2
+            risk_factors.append("Warm water zone")
+        elif 34 <= data.temp <= 38:
+            temp_score = 4
+            risk_factors.append("Optimal growth temperature")
+        else:
+            temp_score = 5
+            risk_factors.append("High metabolic temperature zone")
+
+        turb_score = 2 if data.turb >= 60 else 0
+        if turb_score:
+            risk_factors.append("Elevated turbidity")
+
+        flow_score = 3 if data.flow == 0 else 0
+        if flow_score:
+            risk_factors.append("Stagnant water")
+
+        tds_score = 1 if data.tds >= 250 else 0
+        if tds_score:
+            risk_factors.append("High dissolved solids")
+
+        ph_score = 1 if data.ph >= 7.5 else 0
+        if ph_score:
+            risk_factors.append("Alkaline pH")
+
+        bio_score = temp_score + turb_score + flow_score + tds_score + ph_score
+
+        ml_influence = prob_high * 3
+        final_score = bio_score + ml_influence
+
+        # Escalation logic
+        if final_score < 4:
+            high_count = max(0, high_count - 1)
+        elif 4 <= final_score < 8:
+            high_count += 1
+        else:
+            high_count += 2
+
+        # Persistence thresholds
+        if high_count >= 12:
+            status = "HIGH_GROWTH_POTENTIAL"
+        elif high_count >= 6:
+            status = "SUITABLE_CONDITIONS"
+        else:
+            status = "SAFE"
+
+    risk_percent = min(100, high_count * 8)
 
     save_state(data.device_id, high_count, status)
 
@@ -259,7 +254,7 @@ def predict(data: SensorData):
         "ml_probability": round(prob_high, 4),
         "bio_score": round(bio_score, 2),
         "final_score": round(final_score, 2),
-        "risk_percent": risk_percent,
+        "risk_percent": round(risk_percent, 2),
         "high_count": high_count,
         "status": status,
         "risk_factors": risk_factors,
@@ -282,7 +277,6 @@ def get_devices():
 
     for doc in docs:
         d = doc.to_dict()
-
         if "last_seen" in d:
             last_seen = datetime.fromisoformat(d["last_seen"])
             diff = (now - last_seen).total_seconds()
