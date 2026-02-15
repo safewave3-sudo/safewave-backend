@@ -180,16 +180,15 @@ def predict(data: SensorData):
 
     risk_factors = []
 
-    # Hard biological brake
+    # HARD BIOLOGICAL RESET
     if data.temp < 30:
-        high_count = max(0, high_count - 3)
+        high_count = 0
         status = "SAFE"
         bio_score = 0
         final_score = 0
         risk_factors.append("Temperature below growth threshold")
 
     else:
-
         # Temperature zoning
         if 30 <= data.temp < 34:
             temp_score = 2
@@ -218,11 +217,9 @@ def predict(data: SensorData):
             risk_factors.append("Alkaline pH")
 
         bio_score = temp_score + turb_score + flow_score + tds_score + ph_score
-
         ml_influence = prob_high * 3
         final_score = bio_score + ml_influence
 
-        # Escalation logic
         if final_score < 4:
             high_count = max(0, high_count - 1)
         elif 4 <= final_score < 8:
@@ -230,7 +227,6 @@ def predict(data: SensorData):
         else:
             high_count += 2
 
-        # Persistence thresholds
         if high_count >= 12:
             status = "HIGH_GROWTH_POTENTIAL"
         elif high_count >= 6:
