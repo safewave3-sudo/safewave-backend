@@ -98,7 +98,7 @@ class SensorData(BaseModel):
     temp: float
     tds: float
     turb: float
-    flow: int  # 0 stagnant, 1 flowing
+    flow: int
 
 # =====================================
 # Rolling Feature Builder
@@ -106,7 +106,7 @@ class SensorData(BaseModel):
 def build_features(df_hist, latest_data):
     now_time = datetime.now(ist)
 
-    feature_dict = {
+    return {
         "temp_mean": df_hist["temp"].mean(),
         "temp_std": df_hist["temp"].std(),
         "temp_last": latest_data.temp,
@@ -132,8 +132,6 @@ def build_features(df_hist, latest_data):
         "hour_cos": np.cos(2 * np.pi * now_time.hour / 24),
         "dayofweek": now_time.weekday()
     }
-
-    return feature_dict
 
 # =====================================
 # Prediction Endpoint
@@ -168,14 +166,13 @@ def predict(data: SensorData):
         .stream()
 
     records = []
-
     for doc in docs:
         d = doc.to_dict()
         ts = datetime.fromisoformat(d["timestamp"])
         if ts >= six_hours_ago:
             records.append(d)
 
-    # ML Probability
+    # ML probability
     if len(records) < 3:
         prob_high = 0.0
     else:
@@ -185,7 +182,7 @@ def predict(data: SensorData):
         prob_high = rf.predict_proba(row_df)[0][1]
 
     # =====================================
-    # HYBRID EARLY WARNING LOGIC
+    # Hybrid Biological + ML Escalation
     # =====================================
 
     strong_temp = data.temp >= 34
@@ -205,19 +202,24 @@ def predict(data: SensorData):
     state = get_state(data.device_id)
     high_count = state.get("high_count", 0)
 
-    # Strong biological growth trigger
     strong_growth = strong_temp and turb_risk and flow_risk
 
     if strong_growth:
-        # ML accelerates escalation
         high_count += 1 + int(prob_high * 2)
     else:
         high_count = max(0, high_count - 1)
 
-    # Threshold reduced for early warning
-    status = "HIGH_RISK" if high_count >= 8 else "SAFE"
+    # =====================================
+    # 3-Level Status Decision
+    # =====================================
+    if high_count >= 8:
+        status = "HIGH_RISK"
+    elif high_count >= 4:
+        status = "WARNING"
+    else:
+        status = "SAFE"
 
-    risk_percent = min(100, high_count * 12.5)
+    risk_percent = min(100, round((high_count / 8) * 100, 1))
 
     save_state(data.device_id, high_count, status)
 
@@ -232,7 +234,7 @@ def predict(data: SensorData):
         "flow": data.flow,
         "ml_probability": round(prob_high, 4),
         "bio_score": round(bio_score, 2),
-        "risk_percent": round(risk_percent, 2),
+        "risk_percent": risk_percent,
         "high_count": high_count,
         "status": status,
         "timestamp": now_ist()
