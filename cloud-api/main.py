@@ -22,7 +22,7 @@ db = firestore.client()
 # =====================================
 # FastAPI Setup
 # =====================================
-app = FastAPI(title="SAFEWAVE ML API")
+app = FastAPI(title="Naegleria fowleri Environmental Suitability API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -182,44 +182,68 @@ def predict(data: SensorData):
         prob_high = rf.predict_proba(row_df)[0][1]
 
     # =====================================
-    # Hybrid Biological + ML Escalation
+    # ECOLOGICAL SUITABILITY MODEL
     # =====================================
-
-    strong_temp = data.temp >= 34
-    turb_risk = data.turb >= 60
-    flow_risk = data.flow == 0
-    tds_risk = data.tds >= 250
-    ph_risk = data.ph >= 7.5
-
-    bio_score = (
-        (3 if strong_temp else 1) +
-        (1.5 if turb_risk else 0) +
-        (1 if tds_risk else 0) +
-        (1 if flow_risk else 0) +
-        (0.5 if ph_risk else 0)
-    )
 
     state = get_state(data.device_id)
     high_count = state.get("high_count", 0)
 
-    strong_growth = strong_temp and turb_risk and flow_risk
+    risk_factors = []
 
-    if strong_growth:
-        high_count += 1 + int(prob_high * 2)
+    # Temperature zoning
+    if data.temp < 30:
+        temp_score = 0
+    elif 30 <= data.temp < 34:
+        temp_score = 2
+        risk_factors.append("Warm water zone")
+    elif 34 <= data.temp <= 38:
+        temp_score = 4
+        risk_factors.append("Optimal growth temperature")
     else:
-        high_count = max(0, high_count - 1)
+        temp_score = 5
+        risk_factors.append("High metabolic temperature zone")
+
+    turb_score = 2 if data.turb >= 60 else 0
+    flow_score = 3 if data.flow == 0 else 0
+    tds_score = 1 if data.tds >= 250 else 0
+    ph_score = 1 if data.ph >= 7.5 else 0
+
+    if turb_score:
+        risk_factors.append("Elevated turbidity")
+    if flow_score:
+        risk_factors.append("Stagnant water")
+    if tds_score:
+        risk_factors.append("High dissolved solids")
+    if ph_score:
+        risk_factors.append("Alkaline pH")
+
+    bio_score = temp_score + turb_score + flow_score + tds_score + ph_score
+
+    ml_influence = prob_high * 3
+    final_score = bio_score + ml_influence
+
+    if prob_high > 0.6:
+        risk_factors.append("ML anomaly pattern detected")
 
     # =====================================
-    # 3-Level Status Decision
+    # Multi-Level Risk Classification
     # =====================================
-    if high_count >= 8:
-        status = "HIGH_RISK"
-    elif high_count >= 4:
-        status = "WARNING"
+
+    if final_score < 4:
+        high_count = max(0, high_count - 1)
+    elif 4 <= final_score < 8:
+        high_count += 1
+    else:
+        high_count += 2
+
+    if high_count >= 12:
+        status = "HIGH_GROWTH_POTENTIAL"
+    elif high_count >= 6:
+        status = "SUITABLE_CONDITIONS"
     else:
         status = "SAFE"
 
-    risk_percent = min(100, round((high_count / 8) * 100, 1))
+    risk_percent = min(100, round(high_count * 8, 1))
 
     save_state(data.device_id, high_count, status)
 
@@ -234,9 +258,11 @@ def predict(data: SensorData):
         "flow": data.flow,
         "ml_probability": round(prob_high, 4),
         "bio_score": round(bio_score, 2),
+        "final_score": round(final_score, 2),
         "risk_percent": risk_percent,
         "high_count": high_count,
         "status": status,
+        "risk_factors": risk_factors,
         "timestamp": now_ist()
     }
 
