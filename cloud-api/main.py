@@ -47,7 +47,7 @@ FEATURE_COLS = saved["features"]
 ist = pytz.timezone("Asia/Kolkata")
 
 def now_ist():
-    return datetime.now(ist).isoformat()
+    return datetime.now(ist)
 
 # =====================================
 # Firestore Collections
@@ -104,7 +104,7 @@ class SensorData(BaseModel):
 # Rolling Feature Builder
 # =====================================
 def build_features(df_hist, latest_data):
-    now_time = datetime.now(ist)
+    now_time = now_ist()
 
     return {
         "temp_mean": df_hist["temp"].mean(),
@@ -136,10 +136,12 @@ def predict(data: SensorData):
 
     update_device_status(data.device_id, data.device_name, data.location_name)
 
+    current_time = now_ist()
+
     # Store raw reading
     raw_entry = {
         "device_id": data.device_id,
-        "timestamp": now_ist(),
+        "timestamp": current_time,
         "ph": data.ph,
         "temp": data.temp,
         "tds": data.tds,
@@ -148,20 +150,17 @@ def predict(data: SensorData):
     }
     db.collection(RAW_COLLECTION).add(raw_entry)
 
-    # Fetch last 6 hours
-    now_time = datetime.now(ist)
-    six_hours_ago = now_time - timedelta(hours=6)
+    # Fetch last 6 hours (efficient query)
+    six_hours_ago = current_time - timedelta(hours=6)
 
-    docs = db.collection(RAW_COLLECTION)\
-        .where("device_id", "==", data.device_id)\
+    docs = (
+        db.collection(RAW_COLLECTION)
+        .where("device_id", "==", data.device_id)
+        .where("timestamp", ">=", six_hours_ago)
         .stream()
+    )
 
-    records = []
-    for doc in docs:
-        d = doc.to_dict()
-        ts = datetime.fromisoformat(d["timestamp"])
-        if ts >= six_hours_ago:
-            records.append(d)
+    records = [doc.to_dict() for doc in docs]
 
     # ML Probability
     if len(records) < 3:
@@ -173,14 +172,13 @@ def predict(data: SensorData):
         prob_high = rf.predict_proba(row_df)[0][1]
 
     # =====================================
-    # ECOLOGICAL SUITABILITY MODEL
+    # ECOLOGICAL SUITABILITY MODEL (UNCHANGED)
     # =====================================
     state = get_state(data.device_id)
     high_count = state.get("high_count", 0)
 
     risk_factors = []
 
-    # HARD BIOLOGICAL RESET
     if data.temp < 30:
         high_count = 0
         status = "SAFE"
@@ -189,7 +187,6 @@ def predict(data: SensorData):
         risk_factors.append("Temperature below growth threshold")
 
     else:
-        # Temperature zoning
         if 30 <= data.temp < 34:
             temp_score = 2
             risk_factors.append("Warm water zone")
@@ -254,7 +251,7 @@ def predict(data: SensorData):
         "high_count": high_count,
         "status": status,
         "risk_factors": risk_factors,
-        "timestamp": now_ist()
+        "timestamp": current_time.isoformat()
     }
 
     db.collection(READINGS_COLLECTION).add(result)
@@ -267,19 +264,17 @@ def predict(data: SensorData):
 @app.get("/devices")
 def get_devices():
     devices = []
-    now = datetime.now(ist)
+    now = now_ist()
 
     docs = db.collection(DEVICE_COLLECTION).stream()
 
     for doc in docs:
         d = doc.to_dict()
         if "last_seen" in d:
-            last_seen = datetime.fromisoformat(d["last_seen"])
-            diff = (now - last_seen).total_seconds()
+            diff = (now - d["last_seen"]).total_seconds()
             d["live_status"] = "OFFLINE" if diff > OFFLINE_TIMEOUT else "ONLINE"
         else:
             d["live_status"] = "UNKNOWN"
-
         devices.append(d)
 
     return devices
