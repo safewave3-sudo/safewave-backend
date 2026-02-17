@@ -205,10 +205,18 @@ def process_prediction(data: SensorData):
 
     save_state(data.device_id, high_count, status)
 
+    # ✅ UPDATED: Store sensor values also
     result = {
         "device_id": data.device_id,
         "device_name": data.device_name,
         "location_name": data.location_name,
+
+        "ph": data.ph,
+        "temp": data.temp,
+        "tds": data.tds,
+        "turb": data.turb,
+        "flow": data.flow,
+
         "risk_percent": round(risk_percent, 2),
         "status": status,
         "timestamp": current_time
@@ -250,7 +258,7 @@ def get_devices():
     return [doc.to_dict() for doc in docs]
 
 
-# 🔥 NEW ALERTS ENDPOINT
+# ✅ UPDATED ALERTS (with sensor values)
 @app.get("/alerts")
 def get_all_alerts():
 
@@ -277,8 +285,16 @@ def get_all_alerts():
                 "device_id": device_id,
                 "device_name": device_data.get("device_name"),
                 "location_name": device_data.get("location_name"),
+
+                "ph": latest.get("ph"),
+                "temp": latest.get("temp"),
+                "tds": latest.get("tds"),
+                "turb": latest.get("turb"),
+                "flow": latest.get("flow"),
+
                 "risk_percent": latest.get("risk_percent", 0),
                 "status": latest.get("status", "UNKNOWN"),
+                "timestamp": latest.get("timestamp"),
                 "last_seen": device_data.get("last_seen")
             })
 
