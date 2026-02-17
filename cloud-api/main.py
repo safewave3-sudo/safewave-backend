@@ -141,7 +141,6 @@ def process_prediction(data: SensorData):
     update_device_status(data.device_id, data.device_name, data.location_name)
     current_time = now_ist()
 
-    # Store RAW
     db.collection(RAW_COLLECTION).add({
         "device_id": data.device_id,
         "timestamp": current_time,
@@ -152,7 +151,6 @@ def process_prediction(data: SensorData):
         "flow": data.flow
     })
 
-    # Get last 6 hours
     six_hours_ago = current_time - timedelta(hours=6)
 
     docs = (
@@ -175,7 +173,6 @@ def process_prediction(data: SensorData):
     state = get_state(data.device_id)
     high_count = state.get("high_count", 0)
 
-    # Simple ecological scoring
     bio_score = 0
     if data.temp >= 34:
         bio_score += 4
@@ -212,16 +209,7 @@ def process_prediction(data: SensorData):
         "device_id": data.device_id,
         "device_name": data.device_name,
         "location_name": data.location_name,
-        "ph": data.ph,
-        "temp": data.temp,
-        "tds": data.tds,
-        "turb": data.turb,
-        "flow": data.flow,
-        "ml_probability": round(prob_high, 4),
-        "bio_score": round(bio_score, 2),
-        "final_score": round(final_score, 2),
         "risk_percent": round(risk_percent, 2),
-        "high_count": high_count,
         "status": status,
         "timestamp": current_time
     }
@@ -252,7 +240,6 @@ def get_latest(device_id: str):
         .limit(1)
         .stream()
     )
-
     results = [doc.to_dict() for doc in docs]
     return results[0] if results else {"message": "No data found"}
 
@@ -261,6 +248,41 @@ def get_latest(device_id: str):
 def get_devices():
     docs = db.collection(DEVICE_COLLECTION).stream()
     return [doc.to_dict() for doc in docs]
+
+
+# 🔥 NEW ALERTS ENDPOINT
+@app.get("/alerts")
+def get_all_alerts():
+
+    devices = db.collection(DEVICE_COLLECTION).stream()
+    alerts = []
+
+    for device in devices:
+        device_data = device.to_dict()
+        device_id = device_data.get("device_id")
+
+        docs = (
+            db.collection(READINGS_COLLECTION)
+            .where("device_id", "==", device_id)
+            .order_by("timestamp", direction=firestore.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+
+        results = [doc.to_dict() for doc in docs]
+        latest = results[0] if results else None
+
+        if latest:
+            alerts.append({
+                "device_id": device_id,
+                "device_name": device_data.get("device_name"),
+                "location_name": device_data.get("location_name"),
+                "risk_percent": latest.get("risk_percent", 0),
+                "status": latest.get("status", "UNKNOWN"),
+                "last_seen": device_data.get("last_seen")
+            })
+
+    return alerts
 
 
 @app.get("/health")
