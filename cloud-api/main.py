@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from pathlib import Path
 import traceback
@@ -14,8 +14,8 @@ import traceback
 # =====================================
 # Firebase Initialization
 # =====================================
-cred = credentials.Certificate("firebase_key.json")
-if not firebase_admin._apps:
+cred = credentials.Certificate(firebase_key.json)
+if not firebase_admin._apps
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
@@ -23,216 +23,284 @@ db = firestore.client()
 # =====================================
 # FastAPI Setup
 # =====================================
-app = FastAPI(title="SAFEWAVE ML API (Optimized)")
+app = FastAPI(title=SAFEWAVE ML API)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=[],
+    allow_headers=[],
 )
 
 # =====================================
 # Load ML Model
 # =====================================
 BASE_DIR = Path(__file__).resolve().parent
-saved = joblib.load(BASE_DIR / "rf_model.joblib")
+saved = joblib.load(BASE_DIR  rf_model.joblib)
 
-rf = saved["model"]
-FEATURE_COLS = saved["features"]
+rf = saved[model]
+FEATURE_COLS = saved[features]
 
 # =====================================
-# Time Setup
+# Time
 # =====================================
-ist = pytz.timezone("Asia/Kolkata")
+ist = pytz.timezone(AsiaKolkata)
 
-def now_ist():
+def now_ist()
     return datetime.now(ist)
 
 # =====================================
 # Collections
 # =====================================
-DEVICE_COLLECTION = "devices"
-STATE_COLLECTION = "device_state"
-RAW_COLLECTION = "sensor_raw"
-READINGS_COLLECTION = "safewave_readings"
+DEVICE_COLLECTION = devices
+STATE_COLLECTION = device_state
+RAW_COLLECTION = sensor_raw
+READINGS_COLLECTION = safewave_readings
 
 # =====================================
-# Schema
+# Schemas
 # =====================================
-class SensorData(BaseModel):
-    device_id: str
-    device_name: str
-    location_name: str
-    ph: float
-    temp: float
-    tds: float
-    turb: float
-    flow: int
+class SensorData(BaseModel)
+    device_id str
+    device_name str
+    location_name str
+    ph float
+    temp float
+    tds float
+    turb float
+    flow int
 
 # =====================================
-# Helper Functions
+# Helpers
 # =====================================
-def safe_std(series):
+def safe_std(series)
     val = series.std()
     return 0.0 if pd.isna(val) else float(val)
 
-def get_state(device_id):
+def get_state(device_id)
     doc = db.collection(STATE_COLLECTION).document(device_id).get()
-    if doc.exists:
+    if doc.exists
         return doc.to_dict()
-    return {"high_count": 0}
+    return {high_count 0}
 
-def save_state(device_id, high_count, status):
+def save_state(device_id, high_count, status)
     db.collection(STATE_COLLECTION).document(device_id).set({
-        "high_count": high_count,
-        "status": status,
-        "timestamp": now_ist()
+        high_count high_count,
+        status status,
+        timestamp now_ist()
     })
 
-def update_device_status(device_id, device_name, location_name):
+def update_device_status(device_id, device_name, location_name)
     db.collection(DEVICE_COLLECTION).document(device_id).set({
-        "device_id": device_id,
-        "device_name": device_name,
-        "location_name": location_name,
-        "last_seen": now_ist(),
-        "status": "ONLINE"
+        device_id device_id,
+        device_name device_name,
+        location_name location_name,
+        last_seen now_ist(),
+        status ONLINE
     }, merge=True)
 
 # =====================================
-# Prediction Logic (OPTIMIZED)
+# ML Feature Builder
 # =====================================
-def process_prediction(data: SensorData):
+def build_features(df_hist, latest)
+    now_time = now_ist()
 
-    current_time = now_ist()
+    return {
+        temp_mean float(df_hist[temp].mean()),
+        temp_std safe_std(df_hist[temp]),
+        temp_last float(latest.temp),
+
+        turb_mean float(df_hist[turb].mean()),
+        turb_std safe_std(df_hist[turb]),
+        turb_last float(latest.turb),
+
+        ph_mean float(df_hist[ph].mean()),
+        ph_std safe_std(df_hist[ph]),
+        ph_last float(latest.ph),
+
+        tds_mean float(df_hist[tds].mean()),
+        tds_std safe_std(df_hist[tds]),
+        tds_last float(latest.tds),
+
+        flow_mean float(df_hist[flow].mean()),
+        flow_std safe_std(df_hist[flow]),
+        flow_last float(latest.flow),
+
+        hour now_time.hour,
+        hour_sin float(np.sin(2np.pinow_time.hour24)),
+        hour_cos float(np.cos(2np.pinow_time.hour24)),
+        dayofweek now_time.weekday()
+    }
+
+# =====================================
+# Prediction Logic
+# =====================================
+def process_prediction(data SensorData)
+
     update_device_status(data.device_id, data.device_name, data.location_name)
+    current_time = now_ist()
 
-    # Store raw history (for ML)
     db.collection(RAW_COLLECTION).add({
-        "device_id": data.device_id,
-        "timestamp": current_time,
-        "ph": data.ph,
-        "temp": data.temp,
-        "tds": data.tds,
-        "turb": data.turb,
-        "flow": data.flow
+        device_id data.device_id,
+        timestamp current_time,
+        ph data.ph,
+        temp data.temp,
+        tds data.tds,
+        turb data.turb,
+        flow data.flow
     })
 
-    # 🔥 LIMIT HISTORY TO LAST 20 RECORDS ONLY
+    six_hours_ago = current_time - timedelta(hours=6)
+
     docs = (
         db.collection(RAW_COLLECTION)
-        .where("device_id", "==", data.device_id)
-        .order_by("timestamp", direction=firestore.Query.DESCENDING)
-        .limit(20)
+        .where(device_id, ==, data.device_id)
+        .where(timestamp, =, six_hours_ago)
         .stream()
     )
 
     records = [doc.to_dict() for doc in docs]
 
-    if len(records) < 3:
+    if len(records)  3
         prob_high = 0.0
-    else:
+    else
         df_hist = pd.DataFrame(records)
-
-        feature_dict = {
-            "temp_mean": float(df_hist["temp"].mean()),
-            "temp_std": safe_std(df_hist["temp"]),
-            "temp_last": data.temp,
-            "turb_mean": float(df_hist["turb"].mean()),
-            "turb_std": safe_std(df_hist["turb"]),
-            "turb_last": data.turb,
-            "ph_mean": float(df_hist["ph"].mean()),
-            "ph_std": safe_std(df_hist["ph"]),
-            "ph_last": data.ph,
-            "tds_mean": float(df_hist["tds"].mean()),
-            "tds_std": safe_std(df_hist["tds"]),
-            "tds_last": data.tds,
-            "flow_mean": float(df_hist["flow"].mean()),
-            "flow_std": safe_std(df_hist["flow"]),
-            "flow_last": data.flow,
-            "hour": current_time.hour,
-            "hour_sin": float(np.sin(2*np.pi*current_time.hour/24)),
-            "hour_cos": float(np.cos(2*np.pi*current_time.hour/24)),
-            "dayofweek": current_time.weekday()
-        }
-
-        row_df = pd.DataFrame([{col: feature_dict.get(col, 0.0) for col in FEATURE_COLS}])
+        feature_dict = build_features(df_hist, data)
+        row_df = pd.DataFrame([{col feature_dict.get(col, 0.0) for col in FEATURE_COLS}])
         prob_high = float(rf.predict_proba(row_df)[0][1])
 
     state = get_state(data.device_id)
-    high_count = state.get("high_count", 0)
+    high_count = state.get(high_count, 0)
 
     bio_score = 0
-    if data.temp >= 34: bio_score += 4
-    if data.turb >= 60: bio_score += 2
-    if data.flow == 0: bio_score += 3
-    if data.tds >= 250: bio_score += 1
-    if data.ph >= 7.5: bio_score += 1
+    if data.temp = 34
+        bio_score += 4
+    if data.turb = 60
+        bio_score += 2
+    if data.flow == 0
+        bio_score += 3
+    if data.tds = 250
+        bio_score += 1
+    if data.ph = 7.5
+        bio_score += 1
 
-    final_score = bio_score + (prob_high * 3)
+    final_score = bio_score + (prob_high  3)
 
-    if final_score < 4:
+    if final_score  4
         high_count = max(0, high_count - 1)
-    elif final_score < 8:
+    elif final_score  8
         high_count += 1
-    else:
+    else
         high_count += 2
 
-    if high_count >= 12:
-        status = "HIGH_GROWTH_POTENTIAL"
-    elif high_count >= 6:
-        status = "SUITABLE_CONDITIONS"
-    else:
-        status = "SAFE"
+    if high_count = 12
+        status = HIGH_GROWTH_POTENTIAL
+    elif high_count = 6
+        status = SUITABLE_CONDITIONS
+    else
+        status = SAFE
 
-    risk_percent = min(100, high_count * 8)
+    risk_percent = min(100, high_count  8)
 
     save_state(data.device_id, high_count, status)
 
+    # ✅ UPDATED Store sensor values also
     result = {
-        "device_id": data.device_id,
-        "device_name": data.device_name,
-        "location_name": data.location_name,
-        "ph": data.ph,
-        "temp": data.temp,
-        "tds": data.tds,
-        "turb": data.turb,
-        "flow": data.flow,
-        "risk_percent": round(risk_percent, 2),
-        "status": status,
-        "timestamp": current_time
+        device_id data.device_id,
+        device_name data.device_name,
+        location_name data.location_name,
+
+        ph data.ph,
+        temp data.temp,
+        tds data.tds,
+        turb data.turb,
+        flow data.flow,
+
+        risk_percent round(risk_percent, 2),
+        status status,
+        timestamp current_time
     }
 
-    # 🔥 Store latest as fixed document (NO heavy query needed)
-    db.collection(READINGS_COLLECTION).document(data.device_id).set(result)
+    db.collection(READINGS_COLLECTION).add(result)
 
     return result
 
 # =====================================
-# API Endpoints
+# API ENDPOINTS
 # =====================================
 
-@app.post("/predict")
-def predict(data: SensorData):
-    try:
+@app.post(predict)
+def predict(data SensorData)
+    try
         return process_prediction(data)
-    except Exception:
+    except Exception
         traceback.print_exc()
-        return {"error": "Internal Server Error"}
+        return {error Internal Server Error}
 
-@app.get("/latest/{device_id}")
-def get_latest(device_id: str):
-    doc = db.collection(READINGS_COLLECTION).document(device_id).get()
-    if doc.exists:
-        return doc.to_dict()
-    return {"message": "No data found"}
 
-@app.get("/devices")
-def get_devices():
+@app.get(latest{device_id})
+def get_latest(device_id str)
+    docs = (
+        db.collection(READINGS_COLLECTION)
+        .where(device_id, ==, device_id)
+        .order_by(timestamp, direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+    results = [doc.to_dict() for doc in docs]
+    return results[0] if results else {message No data found}
+
+
+@app.get(devices)
+def get_devices()
     docs = db.collection(DEVICE_COLLECTION).stream()
     return [doc.to_dict() for doc in docs]
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+
+# ✅ UPDATED ALERTS (with sensor values)
+@app.get(alerts)
+def get_all_alerts()
+
+    devices = db.collection(DEVICE_COLLECTION).stream()
+    alerts = []
+
+    for device in devices
+        device_data = device.to_dict()
+        device_id = device_data.get(device_id)
+
+        docs = (
+            db.collection(READINGS_COLLECTION)
+            .where(device_id, ==, device_id)
+            .order_by(timestamp, direction=firestore.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+
+        results = [doc.to_dict() for doc in docs]
+        latest = results[0] if results else None
+
+        if latest
+            alerts.append({
+                device_id device_id,
+                device_name device_data.get(device_name),
+                location_name device_data.get(location_name),
+
+                ph latest.get(ph),
+                temp latest.get(temp),
+                tds latest.get(tds),
+                turb latest.get(turb),
+                flow latest.get(flow),
+
+                risk_percent latest.get(risk_percent, 0),
+                status latest.get(status, UNKNOWN),
+                timestamp latest.get(timestamp),
+                last_seen device_data.get(last_seen)
+            })
+
+    return alerts
+
+
+@app.get(health)
+def health()
+    return {status ok}
