@@ -91,14 +91,20 @@ def save_state(device_id, high_count, status):
         "timestamp": now_ist()
     })
 
-def update_device_status(device_id, device_name, location_name):
-    db.collection(DEVICE_COLLECTION).document(device_id).set({
+def update_device_status(device_id, device_name, location_name, latest_data=None):
+    data = {
         "device_id": device_id,
         "device_name": device_name,
         "location_name": location_name,
         "last_seen": now_ist(),
         "status": "ONLINE"
-    }, merge=True)
+    }
+
+    # ✅ Store latest reading inside device document (READ OPTIMIZATION)
+    if latest_data:
+        data["latest"] = latest_data
+
+    db.collection(DEVICE_COLLECTION).document(device_id).set(data, merge=True)
 
 # =====================================
 # ML Feature Builder
@@ -138,7 +144,6 @@ def build_features(df_hist, latest):
 # =====================================
 def process_prediction(data: SensorData):
 
-    update_device_status(data.device_id, data.device_name, data.location_name)
     current_time = now_ist()
 
     db.collection(RAW_COLLECTION).add({
@@ -205,24 +210,29 @@ def process_prediction(data: SensorData):
 
     save_state(data.device_id, high_count, status)
 
-    # ✅ UPDATED: Store sensor values also
     result = {
         "device_id": data.device_id,
         "device_name": data.device_name,
         "location_name": data.location_name,
-
         "ph": data.ph,
         "temp": data.temp,
         "tds": data.tds,
         "turb": data.turb,
         "flow": data.flow,
-
         "risk_percent": round(risk_percent, 2),
         "status": status,
         "timestamp": current_time
     }
 
     db.collection(READINGS_COLLECTION).add(result)
+
+    # ✅ update device doc with latest data
+    update_device_status(
+        data.device_id,
+        data.device_name,
+        data.location_name,
+        latest_data=result
+    )
 
     return result
 
@@ -239,17 +249,14 @@ def predict(data: SensorData):
         return {"error": "Internal Server Error"}
 
 
+# ✅ NOW SINGLE DOCUMENT READ
 @app.get("/latest/{device_id}")
 def get_latest(device_id: str):
-    docs = (
-        db.collection(READINGS_COLLECTION)
-        .where("device_id", "==", device_id)
-        .order_by("timestamp", direction=firestore.Query.DESCENDING)
-        .limit(1)
-        .stream()
-    )
-    results = [doc.to_dict() for doc in docs]
-    return results[0] if results else {"message": "No data found"}
+    doc = db.collection(DEVICE_COLLECTION).document(device_id).get()
+    if doc.exists:
+        data = doc.to_dict()
+        return data.get("latest", {"message": "No data found"})
+    return {"message": "No device found"}
 
 
 @app.get("/devices")
@@ -258,7 +265,7 @@ def get_devices():
     return [doc.to_dict() for doc in docs]
 
 
-# ✅ UPDATED ALERTS (with sensor values)
+# ✅ ALERTS NOW USE ONLY DEVICE COLLECTION
 @app.get("/alerts")
 def get_all_alerts():
 
@@ -267,34 +274,14 @@ def get_all_alerts():
 
     for device in devices:
         device_data = device.to_dict()
-        device_id = device_data.get("device_id")
-
-        docs = (
-            db.collection(READINGS_COLLECTION)
-            .where("device_id", "==", device_id)
-            .order_by("timestamp", direction=firestore.Query.DESCENDING)
-            .limit(1)
-            .stream()
-        )
-
-        results = [doc.to_dict() for doc in docs]
-        latest = results[0] if results else None
+        latest = device_data.get("latest")
 
         if latest:
             alerts.append({
-                "device_id": device_id,
+                "device_id": device_data.get("device_id"),
                 "device_name": device_data.get("device_name"),
                 "location_name": device_data.get("location_name"),
-
-                "ph": latest.get("ph"),
-                "temp": latest.get("temp"),
-                "tds": latest.get("tds"),
-                "turb": latest.get("turb"),
-                "flow": latest.get("flow"),
-
-                "risk_percent": latest.get("risk_percent", 0),
-                "status": latest.get("status", "UNKNOWN"),
-                "timestamp": latest.get("timestamp"),
+                **latest,
                 "last_seen": device_data.get("last_seen")
             })
 
