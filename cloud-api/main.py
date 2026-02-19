@@ -10,17 +10,11 @@ from datetime import datetime, timedelta
 import pytz
 from pathlib import Path
 import traceback
-import os
 
 # =====================================
 # Firebase Initialization
 # =====================================
-BASE_DIR = Path(__file__).resolve().parent
-
-cred = credentials.Certificate(
-    os.path.join(BASE_DIR, "firebase_key.json")
-)
-
+cred = credentials.Certificate("firebase_key.json")
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
@@ -42,7 +36,9 @@ app.add_middleware(
 # =====================================
 # Load ML Model
 # =====================================
+BASE_DIR = Path(__file__).resolve().parent
 saved = joblib.load(BASE_DIR / "rf_model.joblib")
+
 rf = saved["model"]
 FEATURE_COLS = saved["features"]
 
@@ -63,7 +59,7 @@ RAW_COLLECTION = "sensor_raw"
 READINGS_COLLECTION = "safewave_readings"
 
 # =====================================
-# Schema
+# Schemas
 # =====================================
 class SensorData(BaseModel):
     device_id: str
@@ -105,7 +101,7 @@ def update_device_status(device_id, device_name, location_name):
     }, merge=True)
 
 # =====================================
-# Feature Builder
+# ML Feature Builder
 # =====================================
 def build_features(df_hist, latest):
     now_time = now_ist()
@@ -132,27 +128,20 @@ def build_features(df_hist, latest):
         "flow_last": float(latest.flow),
 
         "hour": now_time.hour,
-        "hour_sin": float(np.sin(2 * np.pi * now_time.hour / 24)),
-        "hour_cos": float(np.cos(2 * np.pi * now_time.hour / 24)),
+        "hour_sin": float(np.sin(2*np.pi*now_time.hour/24)),
+        "hour_cos": float(np.cos(2*np.pi*now_time.hour/24)),
         "dayofweek": now_time.weekday()
     }
 
 # =====================================
-# Prediction Logic (UNCHANGED LOGIC)
+# Prediction Logic
 # =====================================
 def process_prediction(data: SensorData):
 
+    update_device_status(data.device_id, data.device_name, data.location_name)
     current_time = now_ist()
 
-    update_device_status(
-        data.device_id,
-        data.device_name,
-        data.location_name
-    )
-
-    # 🔥 Overwrite per minute (NO unlimited growth)
-    raw_doc_id = f"{data.device_id}_{current_time.strftime('%Y%m%d%H%M')}"
-    db.collection(RAW_COLLECTION).document(raw_doc_id).set({
+    db.collection(RAW_COLLECTION).add({
         "device_id": data.device_id,
         "timestamp": current_time,
         "ph": data.ph,
@@ -168,7 +157,6 @@ def process_prediction(data: SensorData):
         db.collection(RAW_COLLECTION)
         .where("device_id", "==", data.device_id)
         .where("timestamp", ">=", six_hours_ago)
-        .limit(40)   # 🔥 important
         .stream()
     )
 
@@ -179,9 +167,7 @@ def process_prediction(data: SensorData):
     else:
         df_hist = pd.DataFrame(records)
         feature_dict = build_features(df_hist, data)
-        row_df = pd.DataFrame(
-            [{col: feature_dict.get(col, 0.0) for col in FEATURE_COLS}]
-        )
+        row_df = pd.DataFrame([{col: feature_dict.get(col, 0.0) for col in FEATURE_COLS}])
         prob_high = float(rf.predict_proba(row_df)[0][1])
 
     state = get_state(data.device_id)
@@ -219,22 +205,24 @@ def process_prediction(data: SensorData):
 
     save_state(data.device_id, high_count, status)
 
+    # ✅ UPDATED: Store sensor values also
     result = {
         "device_id": data.device_id,
         "device_name": data.device_name,
         "location_name": data.location_name,
+
         "ph": data.ph,
         "temp": data.temp,
         "tds": data.tds,
         "turb": data.turb,
         "flow": data.flow,
+
         "risk_percent": round(risk_percent, 2),
         "status": status,
         "timestamp": current_time
     }
 
-    # 🔥 Only ONE document per device
-    db.collection(READINGS_COLLECTION).document(data.device_id).set(result)
+    db.collection(READINGS_COLLECTION).add(result)
 
     return result
 
@@ -250,23 +238,68 @@ def predict(data: SensorData):
         traceback.print_exc()
         return {"error": "Internal Server Error"}
 
+
 @app.get("/latest/{device_id}")
 def get_latest(device_id: str):
-    doc = db.collection(READINGS_COLLECTION).document(device_id).get()
-    if doc.exists:
-        return doc.to_dict()
-    return {"message": "No data found"}
+    docs = (
+        db.collection(READINGS_COLLECTION)
+        .where("device_id", "==", device_id)
+        .order_by("timestamp", direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+    results = [doc.to_dict() for doc in docs]
+    return results[0] if results else {"message": "No data found"}
+
 
 @app.get("/devices")
 def get_devices():
     docs = db.collection(DEVICE_COLLECTION).stream()
     return [doc.to_dict() for doc in docs]
 
-# 🔥 OPTIMIZED ALERTS (single read)
+
+# ✅ UPDATED ALERTS (with sensor values)
 @app.get("/alerts")
 def get_all_alerts():
-    docs = db.collection(READINGS_COLLECTION).stream()
-    return [doc.to_dict() for doc in docs]
+
+    devices = db.collection(DEVICE_COLLECTION).stream()
+    alerts = []
+
+    for device in devices:
+        device_data = device.to_dict()
+        device_id = device_data.get("device_id")
+
+        docs = (
+            db.collection(READINGS_COLLECTION)
+            .where("device_id", "==", device_id)
+            .order_by("timestamp", direction=firestore.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+
+        results = [doc.to_dict() for doc in docs]
+        latest = results[0] if results else None
+
+        if latest:
+            alerts.append({
+                "device_id": device_id,
+                "device_name": device_data.get("device_name"),
+                "location_name": device_data.get("location_name"),
+
+                "ph": latest.get("ph"),
+                "temp": latest.get("temp"),
+                "tds": latest.get("tds"),
+                "turb": latest.get("turb"),
+                "flow": latest.get("flow"),
+
+                "risk_percent": latest.get("risk_percent", 0),
+                "status": latest.get("status", "UNKNOWN"),
+                "timestamp": latest.get("timestamp"),
+                "last_seen": device_data.get("last_seen")
+            })
+
+    return alerts
+
 
 @app.get("/health")
 def health():
